@@ -53,9 +53,9 @@ impl Harness {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let app = if cfg!(debug_assertions) {
-            "herdr-dev"
+            "herdr-gateway-dev"
         } else {
-            "herdr"
+            "herdr-gateway"
         };
         let state = root.join("state").join(app).join("client");
         let session = root.join("config").join(app).join("sessions/fleet");
@@ -108,6 +108,7 @@ impl Harness {
             .env("HERDR_SESSION", "wrong-inherited-session")
             .env("HERDR_PANE_ID", "wrong-local-pane")
             .env_remove("HERDR_CONFIG_PATH")
+            .env_remove("HERDR_ENV")
             .env_remove("HERDR_REMOTE_BINARY");
         command
     }

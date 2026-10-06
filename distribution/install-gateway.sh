@@ -51,3 +51,30 @@ printf 'Installed %s at %s/herdr-gateway\n' "$actual" "$bin_dir"
 if [ "$#" -eq 1 ]; then
   "$bin_dir/herdr-gateway" machine setup "$1" --install
 fi
+if [ "$target" = macos-aarch64 ]; then
+  agent="$HOME/Library/LaunchAgents/com.qazpytre.herdr-gateway-update.plist"
+  logs="$HOME/Library/Logs/herdr-gateway"
+  mkdir -p "$(dirname "$agent")" "$logs"
+  python3 - "$agent" "$bin_dir/herdr-gateway" "$logs" <<'PY'
+import pathlib, plistlib, sys
+agent, binary, logs = map(pathlib.Path, sys.argv[1:])
+job = {
+    'Label': 'com.qazpytre.herdr-gateway-update',
+    'ProgramArguments': [str(binary), 'update', '--machines'],
+    'StartInterval': 3600,
+    'RunAtLoad': True,
+    'EnvironmentVariables': {
+        'PATH': f'{binary.parent}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    },
+    'StandardOutPath': str(logs / 'update.log'),
+    'StandardErrorPath': str(logs / 'update-error.log'),
+}
+agent.write_bytes(plistlib.dumps(job))
+PY
+  domain="gui/$(id -u)"
+  label=com.qazpytre.herdr-gateway-update
+  if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
+    launchctl bootstrap "$domain" "$agent"
+  fi
+  printf 'Hourly gateway updates enabled; logs: %s\n' "$logs"
+fi

@@ -106,10 +106,10 @@ fn spawn_server_with_config(
     _client_socket_path: &PathBuf,
     config: &str,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join("herdr-gateway")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
-    fs::write(config_home.join("herdr/config.toml"), config).unwrap();
+    fs::write(config_home.join("herdr-gateway/config.toml"), config).unwrap();
 
     let pair = native_pty_system()
         .openpty(PtySize {
