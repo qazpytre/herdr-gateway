@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Gateway fork
+- Added a separate `herdr-gateway` namespace and fork-only GitHub Releases update feed, with numeric gateway revision ordering and archived exact-version artifacts.
+- Added an exact SSH alias allowlist for respecting OpenSSH host-key policy on Gateway targets; other saved machines retain strict checking.
+- Added `machine setup <target> --install` and `update --machines` for explicitly approved unattended installation. Destructive remote restarts remain blocked; live handoff requires opt-in.
+- Added verified macOS Apple Silicon and static Linux x86_64 release artifacts, automatic releases from `gateway`, and daily reviewed upstream upgrade proposals.
+- Added a macOS bootstrap LaunchAgent for hourly local and saved-machine updates, with persistent update logs.
+
 ## [0.9.1] - 2026-09-16
 
 ### Added

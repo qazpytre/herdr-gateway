@@ -1,5 +1,8 @@
 # herdr
 
+此仓库是 `qazpytre/herdr-gateway` 分支。安装、自动更新和 Gateway SSH 配置请参阅
+[英文 README](README.md)。下方介绍保留自上游 Herdr。
+
 
 <p align="center">
   <img src="assets/logo.png" alt="herdr" width="100" />
@@ -39,19 +42,11 @@ https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
 
 ## 安装
 
-```bash
-curl -fsSL https://herdr.dev/install.sh | sh
-```
+此分支使用独立的 `herdr-gateway` 二进制、配置目录及 GitHub Releases 更新源，
+不使用上游安装脚本或 Homebrew 包。支持 macOS Apple Silicon 和 Linux x86_64。
 
-或者 `brew install herdr` · `mise use -g herdr` · Windows：`powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [受端点保护的 Windows](https://herdr.dev/zh-cn/docs/windows-beta/) · [二进制文件](https://github.com/herdrdev/herdr/releases)
-
-然后在工作所在的目录启动它：
-
-```bash
-herdr
-```
-
-运行你的智能体、分割窗格，然后安心离开。`ctrl+b q` 分离，`herdr` 重新连接。[快速开始 →](https://herdr.dev/zh-cn/docs/quick-start/)
+请使用[英文 README 的安装及自动更新步骤](README.md#install)。macOS 安装程序会启用
+每小时检查更新，并同步启用的已保存 SSH 机器；不会自动停止远程窗格。
 
 ## 文档
 

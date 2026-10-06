@@ -1,26 +1,15 @@
-# herdr
+# herdr-gateway
 
 
-<p align="center">
-  <img src="assets/logo.png" alt="herdr" width="100" />
-</p>
+Gateway-compatible fork of [Herdr](https://github.com/herdrdev/herdr), maintained in
+[qazpytre/herdr-gateway](https://github.com/qazpytre/herdr-gateway).
 
-<p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#install">install</a> · <a href="https://herdr.dev/docs/quick-start/">quick start</a> · <a href="https://herdr.dev/docs/">docs</a>
-</p>
+Separate binary, configuration, saved machines, and update feed; stock Herdr is
+not replaced. Published platforms: macOS Apple Silicon and Linux x86_64. Linux
+artifacts are static MUSL builds, including support for older glibc hosts.
 
-<p align="center">
-  English · <a href="README.zh-CN.md">简体中文</a>
-</p>
-
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-666666?labelColor=333333" alt="Apache 2.0 license" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases"><img src="https://img.shields.io/github/downloads/herdrdev/herdr/total?labelColor=333333&color=666666" alt="total GitHub release downloads" /></a>
-  <a href="https://github.com/herdrdev/herdr/stargazers"><img src="https://img.shields.io/github/stars/herdrdev/herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases/latest"><img src="https://img.shields.io/github/v/release/herdrdev/herdr?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
-  <a href="https://formulae.brew.sh/formula/herdr"><img src="https://img.shields.io/homebrew/v/herdr?label=homebrew&labelColor=333333&color=666666" alt="Homebrew version" /></a>
-  <a href="https://x.com/herdrdev"><img src="https://img.shields.io/badge/follow-%40herdrdev-000000?logo=x&logoColor=white" alt="follow @herdrdev on X" /></a>
-</p>
+[Gateway releases](https://github.com/qazpytre/herdr-gateway/releases) ·
+[Upstream documentation](https://herdr.dev/docs/) · [Apache 2.0 license](LICENSE)
 
 ---
 
@@ -42,22 +31,97 @@ https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
 ## install
 
 ```bash
-curl -fsSL https://herdr.dev/install.sh | sh
+installer=$(mktemp)
+curl -fsSL https://github.com/qazpytre/herdr-gateway/releases/latest/download/install-gateway.sh -o "$installer" \
+  && sh "$installer"
+rm -f "$installer"
 ```
 
-or `brew install herdr` · `mise use -g herdr` · windows: `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [endpoint-protected Windows](https://herdr.dev/docs/windows-beta/) · [binaries](https://github.com/herdrdev/herdr/releases)
+The installer verifies the binary's SHA-256 and exact gateway identity before
+replacing `~/.local/bin/herdr-gateway`. Ensure `~/.local/bin` is on `PATH`.
+Start with `herdr-gateway`. Gateway files live under `herdr-gateway` rather than
+`herdr`; existing stock configuration and saved profiles are not imported.
 
-then start it where the work lives:
+On macOS, bootstrap also enables an hourly user LaunchAgent running
+`herdr-gateway update --machines`, including a check when the job loads at login.
+The Mac must be awake and SSH targets reachable. Failures are logged and the next
+scheduled run attempts the update again:
+
+- Job: `~/Library/LaunchAgents/com.qazpytre.herdr-gateway-update.plist`
+- Logs: `~/Library/Logs/herdr-gateway/update.log` and `update-error.log`
+
+To disable automatic checks:
 
 ```bash
-herdr
+launchctl bootout "gui/$(id -u)/com.qazpytre.herdr-gateway-update"
+rm ~/Library/LaunchAgents/com.qazpytre.herdr-gateway-update.plist
 ```
 
-run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches. [quick start →](https://herdr.dev/docs/quick-start/)
+### gateway SSH policy
+
+For an alias whose host-key policy is intentionally configured in `~/.ssh/config`,
+add only that exact alias to `~/.config/herdr-gateway/config.toml`:
+
+```toml
+[remote]
+ssh_config_host_key_targets = ["omarchy-workstation"]
+```
+
+Listed aliases retain their OpenSSH host-key policy during saved-machine and
+unattended connections. All other targets retain strict checking. This does not
+configure Cloudflare, bypass SSH authentication, or change other aliases.
+
+### install and update remote machines
+
+```bash
+# Install the same release as the local gateway; do not change saved profiles.
+herdr-gateway machine setup omarchy-workstation --install
+
+# Save a profile if it is not already present in the gateway catalog.
+herdr-gateway machine add omarchy-workstation --label Omarchy
+
+# Update the Mac and synchronize all enabled saved SSH profiles.
+herdr-gateway update --machines
+
+# Operate on the saved machine without opening a TUI.
+herdr-gateway --machine Omarchy agent list
+```
+
+Bootstrap accepts an optional SSH target: `sh "$installer" omarchy-workstation`.
+`machine setup` also accepts `--remote-session NAME`. Unattended/background
+connections never install binaries unless installation is explicitly approved.
+
+`--install` approves binary installation, **never stopping remote panes**.
+Compatible running servers are kept; their runtime version may remain older than
+the installed binary. An incompatible server that needs a destructive restart
+blocks unattended installation. `--handoff` explicitly opts into live handoff,
+without an unattended destructive-restart fallback:
+
+```bash
+herdr-gateway machine setup omarchy-workstation --install --handoff
+herdr-gateway update --machines --handoff
+```
+
+### release automation
+
+Pushes to the `gateway` branch run contract checks and build both platforms.
+Successful builds publish immutable binaries, checksums, bootstrap, and
+`latest.json` under this fork's GitHub Releases. Gateway binaries consume only
+that feed, never the upstream stable or preview feeds. Versions such as
+`0.9.1-gateway.3` preserve full identity and compare gateway revisions numerically;
+the manifest retains prior releases for exact-version remote installs.
+
+The daily upstream workflow checks the latest stable Herdr release. Clean merges
+are tested and proposed as pull requests in this fork; merge conflicts open an
+issue here. Failed checks block the proposal. Upstream upgrades require review
+and merging into `gateway` before release; they are not automatically merged or
+deployed. No upstream PRs are opened.
 
 ## docs
 
-everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [connecting machines](https://herdr.dev/docs/connecting-machines/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
+General Herdr usage is documented at [herdr.dev/docs](https://herdr.dev/docs/).
+Those guides describe upstream Herdr; use the gateway binary, paths, installer,
+and update commands above for this fork.
 
 ## thanks
 
@@ -72,9 +136,10 @@ if you are an ai agent helping with this repository, read [`AGENTS.md`](./AGENTS
 ## development
 
 ```bash
-git clone https://github.com/herdrdev/herdr
-cd herdr
-cargo build --release
+git clone -b gateway https://github.com/qazpytre/herdr-gateway
+cd herdr-gateway
+# Requires Rust 1.96.1 and Zig 0.16.0 available to the build.
+HERDR_BUILD_CHANNEL=gateway HERDR_BUILD_ID=0 cargo build --release --locked
 
 just test        # unit tests
 just check       # formatting, tests, and maintenance checks
