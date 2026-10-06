@@ -117,6 +117,10 @@ fn update_command() -> Command {
     Command::new("update")
         .about("Download and install the latest version")
         .arg(flag("handoff").help("Try live handoff after installing"))
+        .arg(
+            flag("machines")
+                .help("Install the selected fork release on enabled saved SSH machines"),
+        )
 }
 
 fn status_command() -> Command {

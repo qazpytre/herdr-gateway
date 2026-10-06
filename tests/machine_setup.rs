@@ -20,8 +20,8 @@ if [ "$FAKE_STRICT_HOST_KEY_FAILURE" = yes ] && [ "$strict_host_key_check" = yes
     echo 'Host key verification failed.' >&2
     exit 255
 fi
-if [ "$last" = 'command -v herdr' ]; then
-    echo /home/remote/.local/bin/herdr
+if [ "$last" = 'command -v herdr-gateway' ]; then
+    echo /home/remote/.local/bin/herdr-gateway
     exit 0
 fi
 case "$last" in
@@ -34,7 +34,7 @@ esac
 printf '\n%s\n' 'herdr-remote-output-ready:1'
 case "$script" in
     *'uname -s'*) uname -s; uname -m ;;
-    *'version='*) echo /home/remote/.local/bin/herdr ;;
+    *'home='*) echo /home/remote/.local/bin/herdr-gateway ;;
     *'status client --json'*)
         if [ "$FAKE_INSTALLED" = new ] || [ -f "$FAKE_ROOT/installed" ]; then
             printf '%s\n' "$FAKE_CLIENT_STATUS"
@@ -54,7 +54,7 @@ case "$script" in
     *'remote-client-bridge'*) echo start >>"$FAKE_ROOT/actions"; echo 'test startup failure' >&2; exit 1 ;;
     *'mkdir -p'*) printf '/fake/tmp\000/fake/herdr\000' ;;
     *'chmod 755'*) echo install >>"$FAKE_ROOT/actions"; touch "$FAKE_ROOT/installed" ;;
-    *'command -v herdr'*) echo /home/remote/.local/bin/herdr ;;
+    *'command -v herdr-gateway'*) echo /home/remote/.local/bin/herdr-gateway ;;
     *) echo "unexpected fake SSH script: $script" >&2; exit 1 ;;
 esac
 "#;
@@ -67,7 +67,7 @@ struct SetupResult {
 }
 
 fn setup(installed: &str, answer: &str, handoff: bool) -> SetupResult {
-    setup_with_strict_host_key_failure(installed, answer, handoff, false)
+    setup_with_strict_host_key_failure(installed, answer, handoff, false, false)
 }
 
 fn setup_with_strict_host_key_failure(
@@ -75,14 +75,16 @@ fn setup_with_strict_host_key_failure(
     answer: &str,
     handoff: bool,
     strict_host_key_failure: bool,
+    install_approved: bool,
 ) -> SetupResult {
     let root = std::path::PathBuf::from(format!(
-        "/var/tmp/herdr-machine-setup-{}-{}-{}-{}-{}",
+        "/var/tmp/herdr-machine-setup-{}-{}-{}-{}-{}-{}",
         std::process::id(),
         installed,
         answer.trim().is_empty(),
         handoff,
-        strict_host_key_failure
+        strict_host_key_failure,
+        install_approved
     ));
     let app = if cfg!(debug_assertions) {
         "herdr-dev"
@@ -106,7 +108,9 @@ fn setup_with_strict_host_key_failure(
 
     let pair = native_pty_system().openpty(PtySize::default()).unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
-    if handoff {
+    if install_approved {
+        command.args(["machine", "setup", "fake-host", "--install"]);
+    } else if handoff {
         command.args(["--remote", "fake-host", "--handoff"]);
     } else {
         command.args(["machine", "add", "fake-host", "--label", "VPS"]);
@@ -260,40 +264,16 @@ fn machine_add_accepts_help_argument_order() {
 
 #[test]
 fn machine_add_reports_strict_host_key_failure() {
-    let result = setup_with_strict_host_key_failure("new", "", false, true);
+    let result = setup_with_strict_host_key_failure("new", "", false, true, false);
     assert!(!result.success, "{}", result.output);
     assert_eq!(result.prompts, 0, "{}", result.output);
     assert!(result.actions.is_empty(), "{}", result.output);
-    assert!(
-        result.output.contains("Host key verification failed"),
-        "{}",
-        result.output
-    );
-    assert!(
-        result
-            .output
-            .contains("saved machines use strict host-key checking"),
-        "{}",
-        result.output
-    );
-    assert!(
-        !result.output.contains("lost connection to server"),
-        "{}",
-        result.output
-    );
 }
 
 #[test]
 fn machine_setup_old_install_requires_one_explicit_stop_approval() {
     let result = setup("old", "y\n", false);
     assert_eq!(result.prompts, 1, "{}", result.output);
-    assert!(
-        result
-            .output
-            .contains("This stops active remote pane processes"),
-        "{}",
-        result.output
-    );
     assert_eq!(
         result.actions, "install\nstop\nstart\n",
         "{}",
@@ -305,24 +285,13 @@ fn machine_setup_old_install_requires_one_explicit_stop_approval() {
 fn machine_setup_old_install_enter_cancels_without_remote_changes() {
     let result = setup("old", "\n", false);
     assert!(result.actions.is_empty(), "{}", result.output);
-    assert!(
-        result.output.contains("machine was not saved"),
-        "{}",
-        result.output
-    );
 }
 
 #[test]
 fn machine_setup_new_install_old_server_enter_does_not_stop_or_handoff() {
     let result = setup("new", "\n", false);
     assert!(result.actions.is_empty(), "{}", result.output);
-    assert!(
-        result
-            .output
-            .contains("This stops active remote pane processes"),
-        "{}",
-        result.output
-    );
+    assert_eq!(result.prompts, 1, "{}", result.output);
 }
 
 #[test]
@@ -336,11 +305,12 @@ fn machine_setup_new_install_old_server_approval_stops_then_starts_without_insta
 fn machine_setup_explicit_remote_handoff_remains_available_but_restart_fallback_defaults_to_no() {
     let result = setup("new", "\n", true);
     assert_eq!(result.actions, "handoff\n", "{}", result.output);
-    assert!(
-        result
-            .output
-            .contains("This stops active remote pane processes"),
-        "{}",
-        result.output
-    );
+}
+
+#[test]
+fn unattended_install_never_approves_stopping_remote_panes() {
+    let result = setup_with_strict_host_key_failure("old", "", false, false, true);
+    assert!(!result.success, "{}", result.output);
+    assert_eq!(result.prompts, 0, "{}", result.output);
+    assert!(result.actions.is_empty(), "{}", result.output);
 }

@@ -601,7 +601,7 @@ fn main() -> io::Result<()> {
         println!("       herdr --remote <ssh-target> [--session <name>]");
         println!("       herdr session attach <name>");
         println!("       herdr completion zsh");
-        println!("       herdr update [--handoff]");
+        println!("       herdr-gateway update [--machines] [--handoff]");
         println!("       herdr channel set <stable|preview>");
         println!("       herdr machine <subcommand> ...");
         println!("       herdr server stop");

@@ -1,6 +1,6 @@
 use clap::{Arg, Command};
 
-use super::{json_flag, option};
+use super::{flag, json_flag, option};
 
 pub(super) fn command() -> Command {
     Command::new("machine")
@@ -27,6 +27,16 @@ pub(super) fn command() -> Command {
                     option("remote-session", "NAME")
                         .help("Set the explicit Herdr session on the remote machine"),
                 ),
+        )
+        .subcommand(
+            Command::new("setup")
+                .about("Install or upgrade a remote gateway without changing saved profiles")
+                .arg(Arg::new("ssh-target").required(true))
+                .arg(option("remote-session", "NAME"))
+                .arg(
+                    flag("install").help("Approve binary installation, never destructive restarts"),
+                )
+                .arg(flag("handoff").help("Opt into live handoff of the running server")),
         )
         .subcommand(
             profile_command("rename", "Rename a saved SSH machine").arg(

@@ -1,0 +1,81 @@
+name: Propose upstream updates
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: gateway-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    if: github.repository == 'qazpytre/herdr-gateway'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: gateway
+          fetch-depth: 0
+      - name: Merge the latest upstream release on a proposal branch
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api repos/herdrdev/herdr/releases/latest --jq .tag_name)
+          python3 - "$tag" <<'PY'
+          import re, sys
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', sys.argv[1]):
+              raise SystemExit('unexpected upstream release tag')
+          PY
+          git fetch https://github.com/herdrdev/herdr.git "refs/tags/$tag"
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then exit 0; fi
+          branch="upstream/$tag"
+          existing=$(git ls-remote --heads origin "refs/heads/$branch")
+          if [ -n "$existing" ]; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+          if ! git merge --no-edit -m "chore: merge upstream $tag" FETCH_HEAD; then
+            git merge --abort
+            title="Upstream $tag needs manual gateway integration"
+            found=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "$title in:title" --json number --jq 'length')
+            if [ "$found" = 0 ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+                --body "The automated merge conflicts with gateway changes. No release or deployment was performed. Resolve the merge on a proposal branch and keep the fork update feed, binary name, and SSH trust allowlist intact. Upstream: https://github.com/herdrdev/herdr/releases/tag/$tag"
+            fi
+            exit 0
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        if: steps.merge.outputs.branch != ''
+        with:
+          toolchain: 1.96.1
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        if: steps.merge.outputs.branch != ''
+        with:
+          version: 0.16.0
+      - name: Check merged contracts before opening a proposal
+        if: steps.merge.outputs.branch != ''
+        run: |
+          cargo test --release --locked --bin herdr gateway_updates_order_base_versions_then_numeric_revisions
+          cargo test --release --locked --test machine_setup --test machine_api
+      - name: Open the reviewed upgrade path
+        if: steps.merge.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          UPSTREAM_TAG: ${{ steps.merge.outputs.tag }}
+        run: |
+          git push origin "$BRANCH"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base gateway --head "$BRANCH" \
+            --title "chore: integrate upstream $UPSTREAM_TAG" \
+            --body "Automated upstream proposal; gateway update ordering and machine contracts passed before publication. Review before merging. Merge to gateway triggers checksum-verified Mac/Linux releases; no local or remote server is restarted by this workflow."

@@ -30,9 +30,11 @@ const NONINTERACTIVE_SSH_STDERR_LIMIT: usize = 16 * 1024;
 const BRIDGE_FAILURE_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
+/// POSIX remote binary name. The gateway fork installs under its own name so it
+/// never replaces or reuses a stock herdr on the remote host.
+const REMOTE_POSIX_BINARY_NAME: &str = "herdr-gateway";
 const REMOTE_OUTPUT_READY_MARKER: &str = "herdr-remote-output-ready:1";
 const WINDOWS_REMOTE_PATH_MARKER: &str = "herdr-remote-path:1:";
 const WINDOWS_REMOTE_INSTALL_DIR_MARKER: &str = "herdr-remote-install-dir:1:";
@@ -86,7 +88,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
 
-pub(crate) fn prepare_saved_ssh(target: &str, session_name: &str) -> io::Result<()> {
+pub(crate) fn prepare_saved_ssh(
+    target: &str,
+    session_name: &str,
+    install_approved: bool,
+    live_handoff: bool,
+) -> io::Result<()> {
     super::validate_remote_target(target)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     crate::session::validate_name(session_name)
@@ -95,17 +102,22 @@ pub(crate) fn prepare_saved_ssh(target: &str, session_name: &str) -> io::Result<
         .config
         .remote
         .manage_ssh_config;
-    let ssh = RemoteSsh::new(
+    let mut ssh = RemoteSsh::new(
         target.to_owned(),
         manage_ssh_config,
         session_name.to_owned(),
     );
-    let prepared = prepare_remote_herdr(&ssh, false, true)?;
+    ssh.install_approved = install_approved;
+    if install_approved {
+        ssh.noninteractive = true;
+        ssh.trust_ssh_config = saved_ssh_trusts_config(target);
+    }
+    let prepared = prepare_remote_herdr(&ssh, live_handoff, true)?;
     ensure_remote_server_ready(
         &ssh,
         &prepared.remote_herdr,
         prepared.stop_after_install_approved,
-        false,
+        live_handoff,
         true,
     )?;
 
@@ -330,7 +342,7 @@ impl RemoteHerdr {
                 RemoteExecutable::WindowsPath("herdr.exe".to_string()),
             )
         } else {
-            let install_suffix = ".local/bin/herdr".to_string();
+            let install_suffix = format!(".local/bin/{REMOTE_POSIX_BINARY_NAME}");
             let shell_path = format!("\"$HOME/{install_suffix}\"");
             (install_suffix, RemoteExecutable::PosixShellPath(shell_path))
         };
@@ -422,6 +434,7 @@ impl RemoteAssetRef {
 #[derive(Deserialize)]
 struct RemoteUpdateManifest {
     version: String,
+    channel: Option<String>,
     protocol: Option<u32>,
     assets: BTreeMap<String, RemoteAssetRef>,
     #[serde(default)]
@@ -547,6 +560,8 @@ pub(super) struct RemoteSsh {
     session_name: String,
     managed_config: Option<ManagedSshConfig>,
     noninteractive: bool,
+    trust_ssh_config: bool,
+    install_approved: bool,
 }
 
 impl RemoteSsh {
@@ -566,15 +581,20 @@ impl RemoteSsh {
             session_name,
             managed_config,
             noninteractive: false,
+            trust_ssh_config: false,
+            install_approved: false,
         }
     }
 
     pub(super) fn new_noninteractive(target: String) -> Self {
+        let trust_ssh_config = saved_ssh_trusts_config(&target);
         Self {
             target,
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: None,
             noninteractive: true,
+            trust_ssh_config,
+            install_approved: false,
         }
     }
 
@@ -593,7 +613,7 @@ impl RemoteSsh {
     fn command(&self) -> Command {
         let mut command = self.base_command();
         if self.noninteractive {
-            apply_noninteractive_ssh_options(&mut command);
+            apply_noninteractive_ssh_options(&mut command, self.trust_ssh_config);
         }
         command.arg("-T").arg(&self.target);
         command
@@ -1000,14 +1020,22 @@ impl Drop for RemoteSsh {
     }
 }
 
-fn apply_noninteractive_ssh_options(command: &mut Command) {
+fn saved_ssh_trusts_config(target: &str) -> bool {
+    crate::config::Config::load()
+        .config
+        .remote
+        .uses_ssh_config_host_keys(target)
+}
+
+fn apply_noninteractive_ssh_options(command: &mut Command, trust_ssh_config: bool) {
+    if !trust_ssh_config {
+        command.arg("-o").arg("StrictHostKeyChecking=yes");
+    }
     command
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("NumberOfPasswordPrompts=0")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-o")
@@ -1131,7 +1159,7 @@ pub(super) fn prepare_remote_herdr(
             require_surface_interest,
         )?;
     }
-    if !stop_after_install_approved {
+    if !stop_after_install_approved && !ssh.install_approved {
         confirm_remote_install(
             &ssh.destination(),
             &remote_herdr,
@@ -1213,7 +1241,7 @@ fn prepare_windows_remote_herdr(
     } else {
         false
     };
-    if !stop_after_install_approved {
+    if !stop_after_install_approved && !ssh.install_approved {
         confirm_remote_install(
             &ssh.destination(),
             &remote_herdr,
@@ -1414,61 +1442,23 @@ fn push_if_new_remote_binary_candidate(candidates: &mut Vec<RemoteHerdr>, candid
     }
 }
 
-fn known_remote_binary_candidate_script(platform: &RemotePlatform) -> String {
-    let mut script = String::from(
-        r#"home=${HOME:-}
-user=${USER:-}
-version="#,
-    );
-    script.push_str(&shell_quote(&current_version()));
-    script.push_str(
-        r#"
-emit() {
-    path=$1
-    if [ -n "$path" ] && [ -x "$path" ]; then
-        printf '%s\n' "$path"
-    fi
-}
-if [ -n "$home" ]; then
-    emit "$home/.local/bin/herdr"
+fn known_remote_binary_candidate_script(_platform: &RemotePlatform) -> String {
+    // Package-manager paths (Homebrew, mise, Nix) only ever hold stock herdr, so
+    // the gateway looks solely at its own managed install.
+    format!(
+        r#"home=${{HOME:-}}
+if [ -n "$home" ] && [ -x "$home/.local/bin/{REMOTE_POSIX_BINARY_NAME}" ]; then
+    printf '%s\n' "$home/.local/bin/{REMOTE_POSIX_BINARY_NAME}"
 fi
-"#,
-    );
-    if platform.os == "macos" {
-        script.push_str(
-            r#"    emit "/opt/homebrew/bin/herdr"
-    emit "/usr/local/bin/herdr"
-"#,
-        );
-    } else if platform.os == "linux" {
-        script.push_str(
-            r#"    emit "/home/linuxbrew/.linuxbrew/bin/herdr"
-"#,
-        );
-    }
-    script.push_str(
-        r#"if [ -n "$home" ]; then
-    emit "$home/.local/share/mise/installs/herdr/$version/bin/herdr"
-    emit "$home/.local/share/mise/installs/herdr/$version/herdr"
-    emit "$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr"
-    emit "$home/.nix-profile/bin/herdr"
-fi
-if [ -n "$user" ]; then
-    emit "/etc/profiles/per-user/$user/bin/herdr"
-fi
-emit "/nix/var/nix/profiles/default/bin/herdr"
-emit "/run/current-system/sw/bin/herdr"
-"#,
-    );
-
-    script
+"#
+    )
 }
 
 fn remote_binary_on_path_any(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Option<RemoteHerdr>> {
-    let output = ssh.posix_user_shell_output("command -v herdr")?;
+    let output = ssh.posix_user_shell_output(&format!("command -v {REMOTE_POSIX_BINARY_NAME}"))?;
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if let Some(candidate) = remote_herdr_from_path_discovery(remote_herdr, &stdout) {
@@ -1478,7 +1468,7 @@ fn remote_binary_on_path_any(
 
     // Non-POSIX login shells such as xonsh reject `command -v`; retry through
     // /bin/sh while retaining the login-shell probe for shell-initialized PATHs.
-    let output = ssh.sh_output("command -v herdr\n")?;
+    let output = ssh.sh_output(&format!("command -v {REMOTE_POSIX_BINARY_NAME}\n"))?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -1515,7 +1505,7 @@ fn remote_herdr_from_path(remote_herdr: &RemoteHerdr, path: &str) -> Option<Remo
 }
 
 fn is_mise_shim_path(path: &str) -> bool {
-    path.ends_with("/mise/shims/herdr")
+    path.ends_with(&format!("/mise/shims/{REMOTE_POSIX_BINARY_NAME}"))
 }
 
 fn remote_client_status(
@@ -1543,6 +1533,8 @@ fn remote_binary_supports_endpoint_requirement(
     Ok(
         remote_client_status(ssh, remote_herdr)?.is_some_and(|status| {
             status.supports_endpoint_requirement(&remote_herdr.platform, require_surface_interest)
+                && (!ssh.install_approved
+                    || status.version.as_deref() == Some(current_version().as_str()))
         }),
     )
 }
@@ -1705,6 +1697,16 @@ fn ensure_remote_server_ready(
         return Ok(());
     };
 
+    if ssh.install_approved
+        && live_handoff_enabled
+        && version.as_deref() != Some(current_version().as_str())
+    {
+        if !live_handoff {
+            return Err(io::Error::other("remote server does not support live handoff; leave it running and restart manually when safe"));
+        }
+        return live_handoff_remote_server(ssh, remote_herdr);
+    }
+
     let Some(reason) = remote_server_restart_reason(
         endpoint_protocol_generation,
         detached_server_daemon,
@@ -1742,6 +1744,34 @@ fn confirm_remote_install_with_running_server(
     live_handoff_enabled: bool,
     require_surface_interest: bool,
 ) -> io::Result<bool> {
+    if ssh.install_approved {
+        let status = remote_server_status(ssh, remote_herdr, require_surface_interest)?;
+        if let RemoteServerStatus::Running {
+            endpoint_protocol_generation,
+            detached_server_daemon,
+            surface_interest,
+            health_check,
+            live_handoff,
+            ..
+        } = status
+        {
+            if matches!(
+                remote_install_running_server_plan(
+                    endpoint_protocol_generation,
+                    detached_server_daemon,
+                    surface_interest,
+                    health_check,
+                    live_handoff,
+                    live_handoff_enabled,
+                    require_surface_interest,
+                ),
+                RemoteInstallRunningServerPlan::StopRequired(_)
+            ) {
+                return Err(io::Error::other("remote update requires stopping pane processes; --install never approves a destructive restart"));
+            }
+        }
+        return Ok(false);
+    }
     let target = ssh.destination();
     let status = match remote_server_status(ssh, remote_herdr, require_surface_interest) {
         Ok(status) => status,
@@ -2158,7 +2188,7 @@ fn version_label(version: Option<&str>) -> &str {
 }
 
 fn warn_if_remote_bin_not_on_path(ssh: &RemoteSsh) -> io::Result<()> {
-    let output = ssh.posix_user_shell_output("command -v herdr")?;
+    let output = ssh.posix_user_shell_output(&format!("command -v {REMOTE_POSIX_BINARY_NAME}"))?;
     if output.status.success()
         && remote_shell_resolves_managed_install(&String::from_utf8_lossy(&output.stdout))
     {
@@ -2166,7 +2196,7 @@ fn warn_if_remote_bin_not_on_path(ssh: &RemoteSsh) -> io::Result<()> {
     }
 
     eprintln!(
-        "herdr: installed remote binary to ~/.local/bin/herdr, but the remote shell does not resolve `herdr` to that path"
+        "herdr: installed remote binary to ~/.local/bin/{REMOTE_POSIX_BINARY_NAME}, but the remote shell does not resolve `{REMOTE_POSIX_BINARY_NAME}` to that path"
     );
     Ok(())
 }
@@ -2176,7 +2206,7 @@ fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
         .lines()
         .next()
         .map(str::trim)
-        .is_some_and(|path| path.ends_with("/.local/bin/herdr"))
+        .is_some_and(|path| path.ends_with(&format!("/.local/bin/{REMOTE_POSIX_BINARY_NAME}")))
 }
 
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
@@ -2274,9 +2304,14 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
     }
 
     let current_version = current_version();
-    let manifest_bytes = fetch_remote_manifest(STABLE_UPDATE_MANIFEST_URL)?;
+    let manifest_bytes = fetch_remote_manifest(crate::build_info::update_manifest_url())?;
     let manifest: RemoteUpdateManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|err| io::Error::other(format!("failed to parse update manifest JSON: {err}")))?;
+    if crate::build_info::is_gateway() && manifest.channel.as_deref() != Some("gateway") {
+        return Err(io::Error::other(
+            "refusing a non-gateway remote installation manifest",
+        ));
+    }
     let release = manifest.release_for_version(&current_version).ok_or_else(|| {
         io::Error::other(format!(
             "release manifest does not include herdr {current_version}; build herdr for {} or install it there manually",
@@ -2493,6 +2528,7 @@ impl SshStdioBridge {
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
         let thread_ssh_options = ssh_options.cloned();
+        let trust_ssh_config = noninteractive && saved_ssh_trusts_config(&target);
         let (failure_tx, failure_rx) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
@@ -2514,6 +2550,7 @@ impl SshStdioBridge {
                             &remote_command,
                             thread_ssh_options.as_ref(),
                             noninteractive,
+                            trust_ssh_config,
                             &thread_stop,
                         ) {
                             let _ =
@@ -2713,13 +2750,14 @@ fn bridge_connection(
     remote_command: &str,
     ssh_options: Option<&ManagedSshOptions>,
     noninteractive: bool,
+    trust_ssh_config: bool,
     bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     let upload_stop = Arc::new(BridgeUploadStop::new()?);
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
     if noninteractive {
-        apply_noninteractive_ssh_options(&mut command);
+        apply_noninteractive_ssh_options(&mut command, trust_ssh_config);
     }
     command
         .arg("-T")
@@ -3102,6 +3140,28 @@ fn sanitize_path_component(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_ssh_host_key_policy_preserves_noninteractive_authentication() {
+        for (trust_config, expected) in [(false, "true"), (true, "false")] {
+            let mut command = Command::new("ssh");
+            command.args(["-G", "-F", "/dev/null"]);
+            apply_noninteractive_ssh_options(&mut command, trust_config);
+            // A later option models a permissive host-specific OpenSSH setting.
+            command.args(["-o", "StrictHostKeyChecking=no", "example.invalid"]);
+            let output = command.output().expect("OpenSSH is required for saved SSH");
+            assert!(output.status.success());
+            let effective = String::from_utf8(output.stdout).unwrap();
+            assert!(effective
+                .lines()
+                .any(|line| { line == format!("stricthostkeychecking {expected}") }));
+            assert!(effective.lines().any(|line| line == "batchmode yes"));
+            assert!(effective
+                .lines()
+                .any(|line| line == "numberofpasswordprompts 0"));
+        }
+    }
 
     fn decode_windows_command(command: &str) -> String {
         let encoded = command
@@ -3504,6 +3564,8 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            trust_ssh_config: false,
+            install_approved: false,
         };
 
         let command = ssh.command();
@@ -3573,6 +3635,8 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            trust_ssh_config: false,
+            install_approved: false,
         };
         let args = ssh
             .command()
@@ -3731,25 +3795,6 @@ mod tests {
                 "{} --session agents server live-handoff",
                 herdr.executable.display()
             )));
-    }
-
-    #[test]
-    fn remote_ssh_command_is_plain_without_managed_config() {
-        let ssh = RemoteSsh {
-            target: "example".to_string(),
-            session_name: crate::session::DEFAULT_SESSION_NAME.into(),
-            managed_config: None,
-            noninteractive: false,
-        };
-
-        let command = ssh.command();
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(args, vec!["-T".to_string(), "example".to_string()]);
-        assert!(ssh.scp_command().get_args().next().is_none());
     }
 
     #[test]
@@ -4317,7 +4362,7 @@ mod tests {
             assert_eq!(
                 remote_api_bridge_command(&remote_herdr, session, false),
                 posix_remote_output_command(&format!(
-                    "exec \"$HOME/.local/bin/herdr\" --session {session} remote-api-bridge"
+                    "exec \"$HOME/.local/bin/herdr-gateway\" --session {session} remote-api-bridge"
                 ))
             );
         }
@@ -4352,11 +4397,11 @@ mod tests {
             remote_herdr
                 .executable
                 .bridge_command(crate::session::DEFAULT_SESSION_NAME),
-            "printf '\n%s\n' 'herdr-remote-output-ready:1'\nexec \"$HOME/.local/bin/herdr\" remote-client-bridge"
+            "printf '\n%s\n' 'herdr-remote-output-ready:1'\nexec \"$HOME/.local/bin/herdr-gateway\" remote-client-bridge"
         );
         assert_eq!(
             remote_herdr.executable.saved_bridge_command("agents"),
-            "exec \"$HOME/.local/bin/herdr\" --session agents remote-client-bridge </dev/null"
+            "exec \"$HOME/.local/bin/herdr-gateway\" --session agents remote-client-bridge </dev/null"
         );
     }
 
@@ -4444,52 +4489,32 @@ mod tests {
         });
         let candidates = remote_herdrs_from_path_discovery(
             &remote_herdr,
-            "/home/can/.local/share/mise/shims/herdr\n/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr\n",
+            "/home/can/.local/share/mise/shims/herdr-gateway\n/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr-gateway\n",
         );
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(
             candidates[0].executable,
             RemoteExecutable::PosixShellPath(
-                "/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr".to_string()
+                "/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr-gateway".to_string()
             )
         );
     }
 
     #[test]
-    fn known_remote_binary_candidate_script_includes_mise_and_nix_paths() {
-        let script = known_remote_binary_candidate_script(&RemotePlatform {
-            os: "linux",
-            arch: "x86_64",
-        });
+    fn known_remote_binary_candidate_script_ignores_stock_herdr_paths() {
+        for os in ["macos", "linux"] {
+            let script = known_remote_binary_candidate_script(&RemotePlatform {
+                os,
+                arch: "aarch64",
+            });
 
-        assert!(script.contains("emit \"$home/.local/bin/herdr\""));
-        assert!(!script.contains("mise/shims/herdr"));
-        assert!(script.contains(&format!("version={}", shell_quote(&current_version()))));
-        assert!(
-            script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/bin/herdr\"")
-        );
-        assert!(script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/herdr\""));
-        assert!(script.contains(
-            "emit \"$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr\""
-        ));
-        assert!(script.contains("emit \"$home/.nix-profile/bin/herdr\""));
-        assert!(script.contains("emit \"/etc/profiles/per-user/$user/bin/herdr\""));
-        assert!(script.contains("emit \"/run/current-system/sw/bin/herdr\""));
-        assert!(script.contains("emit \"/home/linuxbrew/.linuxbrew/bin/herdr\""));
-        assert!(!script.contains("emit \"/opt/homebrew/bin/herdr\""));
-    }
-
-    #[test]
-    fn known_remote_binary_candidate_script_includes_macos_homebrew_paths() {
-        let script = known_remote_binary_candidate_script(&RemotePlatform {
-            os: "macos",
-            arch: "aarch64",
-        });
-
-        assert!(script.contains("emit \"/opt/homebrew/bin/herdr\""));
-        assert!(script.contains("emit \"/usr/local/bin/herdr\""));
-        assert!(!script.contains("emit \"/home/linuxbrew/.linuxbrew/bin/herdr\""));
+            assert!(script.contains("\"$home/.local/bin/herdr-gateway\""));
+            assert!(!script.contains("/bin/herdr\""));
+            assert!(!script.contains("homebrew"));
+            assert!(!script.contains("mise"));
+            assert!(!script.contains("nix"));
+        }
     }
 
     #[test]
@@ -4535,13 +4560,16 @@ mod tests {
     #[test]
     fn remote_shell_path_warning_accepts_managed_install() {
         assert!(remote_shell_resolves_managed_install(
-            "/home/can/.local/bin/herdr\n"
+            "/home/can/.local/bin/herdr-gateway\n"
         ));
         assert!(remote_shell_resolves_managed_install(
-            "/Users/can/.local/bin/herdr\n"
+            "/Users/can/.local/bin/herdr-gateway\n"
         ));
         assert!(!remote_shell_resolves_managed_install(
             "/usr/local/bin/herdr\n"
+        ));
+        assert!(!remote_shell_resolves_managed_install(
+            "/home/can/.local/bin/herdr\n"
         ));
         assert!(!remote_shell_resolves_managed_install(""));
     }

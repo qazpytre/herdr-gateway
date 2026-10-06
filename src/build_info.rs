@@ -24,6 +24,18 @@ pub fn is_preview() -> bool {
     channel() == "preview"
 }
 
+pub fn is_gateway() -> bool {
+    channel() == "gateway"
+}
+
+pub fn update_manifest_url() -> &'static str {
+    if is_gateway() {
+        "https://github.com/qazpytre/herdr-gateway/releases/latest/download/latest.json"
+    } else {
+        "https://herdr.dev/latest.json"
+    }
+}
+
 fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
     value.and_then(|value| {
         let trimmed = value.trim();

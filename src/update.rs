@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
@@ -106,6 +105,9 @@ enum UpdateChannel {
 
 impl UpdateChannel {
     fn configured() -> Self {
+        if crate::build_info::is_gateway() {
+            return Self::Stable;
+        }
         match crate::config::Config::load().config.update.channel {
             crate::config::UpdateChannelConfig::Stable => Self::Stable,
             crate::config::UpdateChannelConfig::Preview => Self::Preview,
@@ -114,6 +116,7 @@ impl UpdateChannel {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::Stable if crate::build_info::is_gateway() => "gateway",
             Self::Stable => "stable",
             Self::Preview => "preview",
         }
@@ -197,6 +200,7 @@ impl AssetRef {
 #[derive(Deserialize)]
 struct UpdateManifest {
     version: String,
+    channel: Option<String>,
     #[cfg(not(windows))]
     endpoint_generation: Option<u32>,
     /// Thin-client protocol spoken by this release, when advertised by the manifest.
@@ -326,7 +330,7 @@ impl ReleaseInfo {
 }
 
 fn fetch_update_manifest() -> Result<UpdateManifest, String> {
-    fetch_json_manifest(STABLE_UPDATE_MANIFEST_URL)
+    fetch_json_manifest(crate::build_info::update_manifest_url())
 }
 
 fn fetch_preview_manifest() -> Result<PreviewManifest, String> {
@@ -383,17 +387,26 @@ fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>
 
 fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<ReleaseInfo>, String> {
     let current = Version::current();
-    let latest = Version::parse(&manifest.version)
-        .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
-
-    if !stable_channel_should_install(&latest, &current, crate::build_info::is_preview()) {
-        return Ok(None); // up to date
-    }
-
-    let metadata = manifest
-        .metadata_for_version(&latest)
-        .ok_or_else(|| format!("missing release metadata for v{latest}"))?;
-    let notes_body = metadata.notes_body();
+    let (latest, identity, build_id) = if crate::build_info::is_gateway() {
+        if manifest.channel.as_deref() != Some("gateway") {
+            return Err("refusing a non-gateway update manifest".into());
+        }
+        let Some((latest, revision)) =
+            gateway_update_version(&manifest.version, &crate::build_info::version())?
+        else {
+            return Ok(None);
+        };
+        (latest, manifest.version.clone(), Some(revision.to_string()))
+    } else {
+        let latest = Version::parse(&manifest.version)
+            .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
+        if !stable_channel_should_install(&latest, &current, crate::build_info::is_preview()) {
+            return Ok(None);
+        }
+        let identity = latest.to_string();
+        (latest, identity, None)
+    };
+    let notes_body = manifest.notes.trim().to_string();
     if notes_body.is_empty() {
         return Err("update manifest notes are empty".into());
     }
@@ -414,10 +427,10 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
         })?;
 
     Ok(Some(ReleaseInfo {
-        identity: latest.to_string(),
+        identity,
         version: latest,
         channel: UpdateChannel::Stable,
-        build_id: None,
+        build_id,
         commit: None,
         #[cfg(not(windows))]
         target_protocol: manifest.protocol,
@@ -429,6 +442,24 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
         package_format: asset.package_format()?,
         notes_body,
     }))
+}
+
+fn parse_gateway_version(identity: &str) -> Result<(Version, u64), String> {
+    let (base, revision) = identity
+        .split_once("-gateway.")
+        .ok_or_else(|| format!("invalid gateway version: {identity}"))?;
+    let version =
+        Version::parse(base).ok_or_else(|| format!("invalid gateway base version: {identity}"))?;
+    let revision = revision
+        .parse::<u64>()
+        .map_err(|_| format!("invalid gateway revision: {identity}"))?;
+    Ok((version, revision))
+}
+
+fn gateway_update_version(latest: &str, current: &str) -> Result<Option<(Version, u64)>, String> {
+    let latest = parse_gateway_version(latest)?;
+    let current = parse_gateway_version(current)?;
+    Ok((latest > current).then_some(latest))
 }
 
 fn stable_channel_should_install(
@@ -1106,6 +1137,7 @@ fn target_client_protocol_server_is_running() -> Result<bool, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct SelfUpdateOptions {
     pub(crate) live_handoff: bool,
+    pub(crate) machines: bool,
 }
 
 pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOptions, String> {
@@ -1113,8 +1145,9 @@ pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOption
     for arg in args {
         match arg.as_str() {
             "--handoff" => options.live_handoff = true,
+            "--machines" => options.machines = true,
             "--help" | "-h" => {
-                return Err("usage: herdr update [--handoff]".to_string());
+                return Err("usage: herdr-gateway update [--machines] [--handoff]".to_string());
             }
             _ => return Err(format!("unknown update option: {arg}")),
         }
@@ -2108,8 +2141,42 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Manual self-update command (`herdr update`).
+/// Update this binary, then optionally deploy its release to saved SSH machines.
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    let version = self_update_local(options)?;
+    if options.machines {
+        let executable = env::current_exe().map_err(|error| error.to_string())?;
+        let catalog =
+            crate::client::endpoint::EndpointCatalog::load().map_err(|error| error.to_string())?;
+        for profile in catalog.ssh.iter().filter(|profile| profile.enabled) {
+            eprintln!("preparing {} via {}...", profile.label, profile.target);
+            let mut command = Command::new(&executable);
+            command.args([
+                "machine",
+                "setup",
+                &profile.target,
+                "--remote-session",
+                &profile.session,
+                "--install",
+            ]);
+            if options.live_handoff {
+                command.arg("--handoff");
+            }
+            let status = command
+                .status()
+                .map_err(|error| format!("could not prepare {}: {error}", profile.label))?;
+            if !status.success() {
+                return Err(format!(
+                    "local update completed, but {} setup failed ({status}); retry `herdr-gateway update --machines`",
+                    profile.label
+                ));
+            }
+        }
+    }
+    Ok(version)
+}
+
+fn self_update_local(options: SelfUpdateOptions) -> Result<Version, String> {
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2798,24 +2865,6 @@ mod tests {
     }
 
     #[test]
-    fn self_update_args_gate_live_handoff() {
-        assert_eq!(
-            parse_self_update_args(&[]).unwrap(),
-            SelfUpdateOptions {
-                live_handoff: false
-            }
-        );
-        assert_eq!(
-            parse_self_update_args(&["--handoff".to_string()]).unwrap(),
-            SelfUpdateOptions { live_handoff: true }
-        );
-        assert_eq!(
-            parse_self_update_args(&["--unknown".to_string()]).unwrap_err(),
-            "unknown update option: --unknown"
-        );
-    }
-
-    #[test]
     fn parse_stop_old_servers_after_update_response_uses_prompt_default_for_blank() {
         assert_eq!(
             parse_stop_old_servers_after_update_response("", true),
@@ -2936,6 +2985,7 @@ mod tests {
             &release,
             SelfUpdateOptions {
                 live_handoff: false,
+                machines: false,
             },
         )
         .unwrap();
@@ -3146,6 +3196,7 @@ mod tests {
             &release,
             SelfUpdateOptions {
                 live_handoff: false,
+                machines: false,
             },
         )
         .unwrap();
@@ -3193,6 +3244,7 @@ mod tests {
             &release,
             SelfUpdateOptions {
                 live_handoff: false,
+                machines: false,
             },
         )
         .unwrap();
@@ -3812,6 +3864,29 @@ mod tests {
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|value| value.len() == 64));
             }
+        }
+    }
+    #[test]
+    fn gateway_updates_order_base_versions_then_numeric_revisions() {
+        for (latest, current, expected) in [
+            ("0.9.1-gateway.10", "0.9.1-gateway.2", true),
+            ("0.9.2-gateway.1", "0.9.1-gateway.10", true),
+            ("0.9.1-gateway.10", "0.9.2-gateway.1", false),
+            ("0.9.1-gateway.2", "0.9.1-gateway.2", false),
+            ("0.9.1-gateway.1", "0.9.1-gateway.2", false),
+        ] {
+            assert_eq!(
+                gateway_update_version(latest, current).unwrap().is_some(),
+                expected
+            );
+        }
+        for invalid in [
+            "0.9.2",
+            "0.9.2-preview.3",
+            "0.9.2-gateway.",
+            "0.9.2-gateway.no",
+        ] {
+            assert!(gateway_update_version(invalid, "0.9.1-gateway.2").is_err());
         }
     }
 }

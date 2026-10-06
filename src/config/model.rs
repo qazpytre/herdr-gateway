@@ -1023,13 +1023,25 @@ pub struct RemoteConfig {
     /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
     /// Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
+    /// Exact saved SSH targets whose host-key policy comes from OpenSSH config.
+    /// Empty by default; all other saved targets require strict host-key checking.
+    pub ssh_config_host_key_targets: Vec<String>,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
+            ssh_config_host_key_targets: Vec::new(),
         }
+    }
+}
+
+impl RemoteConfig {
+    pub(crate) fn uses_ssh_config_host_keys(&self, target: &str) -> bool {
+        self.ssh_config_host_key_targets
+            .iter()
+            .any(|allowed| allowed == target)
     }
 }
 
@@ -1291,6 +1303,28 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_ssh_host_key_exception_requires_an_exact_target() {
+        let config: Config = toml::from_str(
+            r#"[remote]
+ssh_config_host_key_targets = ["gateway", "*.example.com"]
+"#,
+        )
+        .unwrap();
+        assert!(config.remote.uses_ssh_config_host_keys("gateway"));
+        for target in [
+            "other",
+            "user@gateway",
+            "ssh://gateway",
+            "GATEWAY",
+            "a.example.com",
+        ] {
+            assert!(!config.remote.uses_ssh_config_host_keys(target));
+        }
+        let legacy: Config = toml::from_str("[remote]\nmanage_ssh_config = false").unwrap();
+        assert!(!legacy.remote.uses_ssh_config_host_keys("gateway"));
+    }
 
     #[test]
     fn update_config_defaults_and_parses() {

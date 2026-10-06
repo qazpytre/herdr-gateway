@@ -5,6 +5,7 @@ use crate::client::endpoint::{EndpointCatalog, ProfileId};
 const HELP: &str = "Usage:
   herdr machine list [--json]
   herdr machine add <ssh-target> --label <label> [--remote-session <name>]
+  herdr machine setup <ssh-target> [--remote-session <name>] [--install] [--handoff]
   herdr machine rename <profile-id> --label <label>
   herdr machine remove <profile-id>
   herdr machine enable <profile-id>
@@ -31,6 +32,7 @@ pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(String::as_str) {
         Some("list") => list(&args[1..]),
         Some("add") => add(&args[1..]),
+        Some("setup") => setup(&args[1..]),
         Some("rename") => rename(&args[1..]),
         Some("remove") => remove(&args[1..]),
         Some("enable") => set_enabled(&args[1..], true),
@@ -164,7 +166,7 @@ fn add(args: &[String]) -> std::io::Result<i32> {
             return Ok(2);
         }
     }
-    if let Err(error) = crate::remote::prepare_saved_ssh(&target, &session) {
+    if let Err(error) = crate::remote::prepare_saved_ssh(&target, &session, false, false) {
         eprintln!("error: {error}; machine was not saved");
         crate::remote::print_saved_ssh_error_hint(&error, &target);
         return Ok(1);
@@ -189,6 +191,47 @@ fn add(args: &[String]) -> std::io::Result<i32> {
     })?;
     println!("Saved SSH machine {id}. Remote server is ready.");
     println!("Open Herdr clients connect automatically.");
+    Ok(0)
+}
+
+fn setup(args: &[String]) -> std::io::Result<i32> {
+    let args = super::expand_equals_args(args, &["--remote-session"]);
+    let mut target = None;
+    let mut session = crate::session::DEFAULT_SESSION_NAME.to_owned();
+    let mut install = false;
+    let mut handoff = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--install" => install = true,
+            "--handoff" => handoff = true,
+            "--remote-session" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("--remote-session requires a name");
+                    return Ok(2);
+                };
+                session = value.clone();
+            }
+            value if !value.starts_with('-') && target.is_none() => {
+                target = Some(value.to_owned());
+            }
+            value => {
+                eprintln!("unknown machine setup argument: {value}");
+                return Ok(2);
+            }
+        }
+        index += 1;
+    }
+    let Some(target) = target else {
+        eprintln!("machine setup requires an SSH target");
+        return Ok(2);
+    };
+    if let Err(error) = crate::remote::prepare_saved_ssh(&target, &session, install, handoff) {
+        eprintln!("remote setup failed for {target}: {error}");
+        return Ok(1);
+    }
+    println!("Remote gateway is ready on {target} (session {session}).");
     Ok(0)
 }
 
